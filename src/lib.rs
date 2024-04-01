@@ -111,60 +111,53 @@ impl AsyncRead for EncryptWrapper {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.text.has_remaining() {
-            let n = min(buf.remaining(), this.text.remaining());
-            buf.put_slice(&this.text[..n]);
-            this.text.advance(n);
-            return Poll::Ready(Ok(()));
-        }
 
-        let fut = this.stream.read_buf(&mut this.raw);
-        tokio::pin!(fut);
-        if 0 == ready!(fut.poll(cx))? {
-            return Poll::Ready(Ok(()));
-        }
-
-        // derive session key
-        if this.opening_key.is_none() {
-            let salt_size = this.alogrithm.key_len();
-            if this.raw.remaining() < salt_size {
-                return Poll::Pending;
+        'fill: while this.text.remaining() == 0 {
+            // fill buff
+            let fut = this.stream.read_buf(&mut this.raw);
+            tokio::pin!(fut);
+            if 0 == ready!(fut.poll(cx))? {
+                return Poll::Ready(Ok(()));
             }
-            let key_bytes = hkdf_sha1(&this.raw[..salt_size], &this.master_key);
-            this.raw.advance(salt_size);
-            let unbound_key = UnboundKey::new(this.alogrithm, &key_bytes).expect("wrong key size");
-            this.opening_key = Some(OpeningKey::new(unbound_key, NumeralNonce::new()));
-        }
 
-        let key = this.opening_key.as_mut().unwrap();
-
-        loop {
-            // decrypt payload
-            if let Some(n) = this.payload_length {
-                let n = n as usize;
-                if this.raw.remaining() < n + TAG_LEN {
-                    break;
+            // derive session key
+            if this.opening_key.is_none() {
+                let salt_size = this.alogrithm.key_len();
+                if this.raw.remaining() < salt_size {
+                    continue 'fill;
                 }
-                key.open_in_place(Aad::empty(), &mut this.raw[..n + TAG_LEN])
-                    .map_err(|_| Error::other("decryption fail"))?;
-                this.text.put_slice(&this.raw[..n]);
-                this.raw.advance(n + TAG_LEN);
-                this.payload_length = None;
-            } else {
-                // decrypt length
-                if this.raw.remaining() < 2 + TAG_LEN {
-                    break;
-                }
-                key.open_in_place(Aad::empty(), &mut this.raw[..2 + TAG_LEN])
-                    .map_err(|_| Error::other("decryption fail"))?;
-                let n = this.raw.get_u16();
-                this.raw.advance(TAG_LEN);
-                this.payload_length = Some(n);
+                let key_bytes = hkdf_sha1(&this.raw[..salt_size], &this.master_key);
+                let unbound_key =
+                    UnboundKey::new(this.alogrithm, &key_bytes).expect("wrong key size");
+                this.opening_key = Some(OpeningKey::new(unbound_key, NumeralNonce::new()));
+                this.raw.advance(salt_size);
             }
-        }
 
-        if this.text.remaining() == 0 {
-            return Poll::Pending;
+            let key = this.opening_key.as_mut().unwrap();
+            loop {
+                // decrypt payload
+                if let Some(n) = this.payload_length {
+                    let n = n as usize;
+                    if this.raw.remaining() < n + TAG_LEN {
+                        continue 'fill;
+                    }
+                    key.open_in_place(Aad::empty(), &mut this.raw[..n + TAG_LEN])
+                        .map_err(|_| Error::other("decryption fail"))?;
+                    this.text.put_slice(&this.raw[..n]);
+                    this.payload_length = None;
+                    this.raw.advance(n + TAG_LEN);
+                } else {
+                    // decrypt length
+                    if this.raw.remaining() < 2 + TAG_LEN {
+                        continue 'fill;
+                    }
+                    key.open_in_place(Aad::empty(), &mut this.raw[..2 + TAG_LEN])
+                        .map_err(|_| Error::other("decryption fail"))?;
+                    let n = this.raw.get_u16();
+                    this.payload_length = Some(n);
+                    this.raw.advance(TAG_LEN);
+                }
+            }
         }
 
         let n = min(buf.remaining(), this.text.remaining());

@@ -4,9 +4,10 @@ use ssrust::EncryptWrapper;
 use std::fmt::Display;
 use std::io::{self, Error, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{copy_bidirectional, AsyncWriteExt};
 use tokio::select;
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 use tracing::{info, instrument, Level};
 #[derive(Parser)]
@@ -55,6 +56,7 @@ use tokio::{
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
 
@@ -91,7 +93,6 @@ async fn process(mut client: EncryptWrapper) -> io::Result<()> {
         Addr::Ipv6(ip) => TcpStream::connect((ip, port)).await?,
         Addr::Domain(host) => TcpStream::connect((host, port)).await?,
     };
-    remote.set_nodelay(true)?;
     relay(&mut client, &mut remote, &address).await
 }
 
