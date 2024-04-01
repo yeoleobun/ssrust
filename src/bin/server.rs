@@ -4,7 +4,7 @@ use ssrust::EncryptWrapper;
 use std::fmt::Display;
 use std::io::{self, Error, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tokio::io::{copy_bidirectional, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
