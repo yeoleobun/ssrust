@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version,about, long_about = None)]
 struct Cli {
-    #[arg(long)]
+    #[arg(long,default_value = "0.0.0.0")]
     address: String,
     #[arg(long)]
     port: u16,

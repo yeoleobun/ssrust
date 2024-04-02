@@ -8,10 +8,7 @@ use tokio::{
     select, signal,
 };
 use tracing::{error, info};
-use tracing_subscriber::{
-    fmt::format::FmtSpan,
-    EnvFilter,
-};
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 const NO_AUTHENTICATION: [u8; 2] = [5, 0];
 #[derive(Parser)]
@@ -21,7 +18,7 @@ struct Cli {
     server: String,
     #[arg(long)]
     server_port: u16,
-    #[arg(long)]
+    #[arg(long, default_value = "localhost")]
     local_address: String,
     #[arg(long)]
     local_port: u16,
