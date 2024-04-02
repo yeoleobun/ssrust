@@ -1,26 +1,51 @@
 use std::{
     cmp::min,
+    fmt::Display,
     future::Future,
-    io::{Cursor, Error},
+    io::{self, Cursor, Error},
+    net::{Ipv4Addr, Ipv6Addr},
     task::{ready, Poll},
 };
-
 use bytes::{Buf, BufMut, BytesMut};
+use clap::ValueEnum;
 use md5::Context;
-use ring::rand::{SecureRandom, SystemRandom};
 use ring::{
     aead::{Aad, Algorithm, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey},
     hkdf::{Salt, HKDF_SHA1_FOR_LEGACY_USE_ONLY, HKDF_SHA256},
 };
+use ring::{
+    aead::{AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305},
+    rand::{SecureRandom, SystemRandom},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    select,
 };
+use tracing::{debug, instrument, Level};
 
 const MAX_PAYLOAD_SIZE: usize = 0x3fff;
 const NONCE_SIZE: usize = 12;
 const TAG_LEN: usize = 16;
 const INFO: [&[u8]; 1] = [b"ss-subkey"];
+
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum Method {
+    AES_128_GCM,
+    AES_256_GCM,
+    CHACHA20_POLY1305,
+}
+
+impl From<Method> for &'static Algorithm {
+    fn from(method: Method) -> Self {
+        match method {
+            Method::AES_128_GCM => &AES_128_GCM,
+            Method::AES_256_GCM => &AES_256_GCM,
+            Method::CHACHA20_POLY1305 => &CHACHA20_POLY1305,
+        }
+    }
+}
 
 pub fn derive_key(password: &str, len: usize) -> Vec<u8> {
     assert!(len % 16 == 0);
@@ -232,4 +257,112 @@ impl AsyncWrite for EncryptWrapper {
         tokio::pin!(fut);
         fut.poll(cx)
     }
+}
+
+#[derive(Debug)]
+pub enum Addr {
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+    Domain(String),
+}
+
+impl Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Addr::Ipv4(ip) => write!(f, "{}", ip),
+            Addr::Ipv6(ip) => write!(f, "{}", ip),
+            Addr::Domain(host) => write!(f, "{}", host),
+        }
+    }
+}
+
+pub fn parse_address(buf: &[u8]) -> Option<(Addr, u16, &[u8])> {
+    if buf.len() < 7 {
+        return None;
+    }
+    match buf[0] {
+        1 => {
+            let ip = u32::from_be_bytes((&buf[1..5]).try_into().unwrap());
+            let port = u16::from_be_bytes((&buf[5..7]).try_into().unwrap());
+            Some((Addr::Ipv4(ip.into()), port, &buf[7..]))
+        }
+        3 => {
+            let length = buf[1] as usize;
+            if buf.len() < length + 4 {
+                return None;
+            }
+            let domain = String::from_utf8_lossy(&buf[2..length + 2]).to_string();
+            let port = u16::from_be_bytes((&buf[length + 2..length + 4]).try_into().unwrap());
+            Some((Addr::Domain(domain), port, &buf[length + 4..]))
+        }
+        4 => {
+            if buf.len() < 19 {
+                return None;
+            }
+            let ip = u128::from_be_bytes((&buf[1..17]).try_into().unwrap());
+            let port = u16::from_be_bytes((&buf[17..19]).try_into().unwrap());
+            Some((Addr::Ipv6(ip.into()), port, &buf[19..]))
+        }
+        _ => None,
+    }
+}
+
+pub async fn connect(addr: &Addr, port: u16) -> std::io::Result<TcpStream> {
+    match addr {
+        Addr::Ipv4(ip) => TcpStream::connect((*ip, port)).await,
+        Addr::Ipv6(ip) => TcpStream::connect((*ip, port)).await,
+        Addr::Domain(host) => TcpStream::connect((host.as_ref(), port)).await,
+    }
+}
+
+pub fn serialize(addr: &Addr, port: u16) -> Vec<u8> {
+    let mut res = Vec::new();
+    match addr {
+        Addr::Ipv4(ip) => {
+            res.put_u8(1);
+            res.put_slice(&ip.octets());
+        }
+        Addr::Ipv6(ip) => {
+            res.put_u8(4);
+            res.put_slice(&ip.octets());
+        }
+        Addr::Domain(hostname) => {
+            res.put_u8(3);
+            res.put_u8(hostname.len() as u8);
+            res.put_slice(hostname.as_bytes());
+        }
+    }
+    res.put_u16(port);
+    res
+}
+
+#[instrument(level = Level::TRACE, skip(client, remote), ret)]
+pub async fn relay<A, B>(client: &mut A, remote: &mut B, addr: &str) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf1 = BytesMut::with_capacity(4096);
+    let mut buf2 = BytesMut::with_capacity(4096);
+    loop {
+        select! {
+            res = client.read_buf(&mut buf1) => {
+                if 0 == res?{
+                    break
+                }
+                remote.write_all_buf(&mut buf1).await?
+            }
+            res = remote.read_buf(&mut buf2) => {
+                if 0 == res?{
+                    break
+                }
+                client.write_all_buf(&mut buf2).await?
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                debug!("timeout");
+                break
+            }
+        }
+    }
+    Ok(())
 }
