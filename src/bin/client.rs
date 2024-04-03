@@ -79,7 +79,7 @@ async fn process(mut client: TcpStream, mut remote: EncryptWrapper) -> Result<()
     client.write_all(&buff).await?;
 
     buff.advance(3);
-    let (addr, port, _) = parse_address(&buff).expect("illegal adress");
+    let (addr, port, _) = parse_address(&buff);
 
     // fill initial payload
     client.read_buf(&mut buff).await?;

@@ -1,9 +1,9 @@
 use bytes::BytesMut;
 use clap::{arg, Parser};
-use ssrust::{parse_address, Method};
 use ssrust::{connect, relay, EncryptWrapper};
+use ssrust::{parse_address, Method};
+use std::io::{self, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::io::Result;
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version,about, long_about = None)]
 struct Cli {
-    #[arg(long,default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0")]
     address: String,
     #[arg(long)]
     port: u16,
@@ -40,29 +40,29 @@ async fn main() -> Result<()> {
         tokio::select! {
             result  = listener.accept() => {
                 if let Ok((socket,_)) = result{
-                    socket.set_nodelay(true)?;
+                    let _ = socket.set_nodelay(true);
                     let client = EncryptWrapper::new(socket,algorithm,master_key.clone());
                     tokio::spawn(process(client));
                 }else{
                     error!("accept error");
                 }
             }
-            _ = signal::ctrl_c() => break,
+            _ = signal::ctrl_c() => break
         }
     }
     Ok(())
 }
 
-async fn process(mut client: EncryptWrapper) -> Result<()> {
+async fn process(mut client: EncryptWrapper) -> io::Result<()> {
     let mut buff = BytesMut::new();
     // get remote address
     client.read_buf(&mut buff).await?;
-    let (addr, port, rest) = parse_address(&buff).expect("illegal adress");
+    let (addr, port, rest) = parse_address(&buff);
     let mut remote = connect(&addr, port).await?;
-
+    let _ = remote.set_nodelay(true);
     // maybe with payload
     if !rest.is_empty() {
-        remote.write_all(rest).await?;        
+        remote.write_all(rest).await?;
     }
     relay(&mut client, &mut remote, &format!("{addr}: {port}")).await
 }
