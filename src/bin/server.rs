@@ -1,17 +1,21 @@
-use bytes::BytesMut;
+use anyhow::anyhow;
 use clap::{arg, Parser};
-use ssrust::{connect, relay, EncryptWrapper};
-use ssrust::{parse_address, Method};
-use std::io::{self, Result};
+use futures::{SinkExt, StreamExt};
+use ssrust::{parse_address, relay, Method};
+use ssrust::{Addr, Config, CryptoCodec};
+use std::io::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::select;
 use tokio::{net::TcpListener, signal};
-use tracing::{error, info};
+use tokio_util::codec::Framed;
+use tracing::{debug, error, info};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(version,about, long_about = None)]
-struct Cli {
+struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     address: String,
     #[arg(long)]
@@ -29,40 +33,57 @@ async fn main() -> Result<()> {
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
 
-    let cli = Cli::parse();
-
-    let listener = TcpListener::bind((cli.address, cli.port)).await?;
-    let master_key = ssrust::derive_key(&cli.password, 32);
-    let algorithm = cli.method.into();
-    info!(listening = ?listener.local_addr()?);
+    let args = Args::parse();
+    Config::init(args.method, &args.password);
+    let listener = TcpListener::bind((args.address, args.port)).await?;
 
     loop {
         tokio::select! {
             result  = listener.accept() => {
-                if let Ok((socket,_)) = result{
-                    let _ = socket.set_nodelay(true);
-                    let client = EncryptWrapper::new(socket,algorithm,master_key.clone());
-                    tokio::spawn(process(client));
-                }else{
-                    error!("accept error");
+                match result{
+                    Ok((socket,_)) => {
+                        tokio::spawn(process(socket));
+                    },
+                    Err(err) => {
+                        error!("accept error: {err}");
+                        break;
+                    },
                 }
             }
-            _ = signal::ctrl_c() => break
+            _ = signal::ctrl_c() => {
+                info!("shutdown");
+                break;
+            }
         }
     }
     Ok(())
 }
 
-async fn process(mut client: EncryptWrapper) -> io::Result<()> {
-    let mut buff = BytesMut::new();
+async fn process(client: TcpStream) -> anyhow::Result<()> {
+    client.set_nodelay(true)?;
+    let mut client = Framed::new(client, CryptoCodec::new());
+    let mut buff = client
+        .next()
+        .await
+        .transpose()
+        .and_then(|op| op.ok_or(anyhow!("hehe")))?;
+
     // get remote address
-    client.read_buf(&mut buff).await?;
-    let (addr, port, rest) = parse_address(&buff);
-    let mut remote = connect(&addr, port).await?;
+    // client.read_buf(&mut buff).await?;
+    let (addr, port, rest) = parse_address(&buff)?;
+    debug!("connect: {addr}");
+
+    let mut remote = match &addr {
+        Addr::Ipv4(ip) => TcpStream::connect((*ip, port)).await,
+        Addr::Ipv6(ip) => TcpStream::connect((*ip, port)).await,
+        Addr::Domain(host) => TcpStream::connect((host.as_ref(), port)).await,
+    }?;
     let _ = remote.set_nodelay(true);
     // maybe with payload
     if !rest.is_empty() {
         remote.write_all(rest).await?;
     }
-    relay(&mut client, &mut remote, &format!("{addr}: {port}")).await
+    buff.clear();
+
+    relay(remote, client, buff, addr).await
 }

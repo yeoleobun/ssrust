@@ -1,19 +1,21 @@
+use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use clap::Parser;
-use ssrust::{parse_address, relay, EncryptWrapper, Method};
-use std::io::Result;
+use futures::{sink::SinkExt, StreamExt};
+use ssrust::{parse_address, relay, Config, CryptoCodec, Method};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     select, signal,
 };
-use tracing::{error, info};
+use tokio_util::codec::Framed;
+use tracing::{debug, error, info, instrument, Level};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 const NO_AUTHENTICATION: [u8; 2] = [5, 0];
 #[derive(Parser)]
 #[command(version,about, long_about = None)]
-struct Cli {
+struct Args {
     #[arg(long)]
     server: String,
     #[arg(long)]
@@ -35,25 +37,25 @@ async fn main() -> Result<()> {
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
 
-    let cli = Cli::parse();
-    let listener = TcpListener::bind((cli.local_address, cli.local_port)).await?;
-    let master_key = ssrust::derive_key(&cli.password, 32);
-    let algorithm = cli.method.into();
-    info!(listening = ?listener.local_addr());
+    let args = Args::parse();
+    Config::init(args.method, &args.password);
+    let listener = TcpListener::bind((args.local_address, args.local_port)).await?;
     loop {
         select! {
             res = listener.accept() => {
-                if let Ok((client, _)) = res{
-                    if let Ok(remote) = TcpStream::connect((cli.server.as_ref(), cli.server_port)).await{
-                        let _ = client.set_nodelay(true);
-                        let _ = remote.set_nodelay(true);
-                        let remote = EncryptWrapper::new(remote,algorithm,master_key.clone());
-                        tokio::spawn(process(client, remote));
-                    }else{
-                        error!("remote not available");
-                    }
-                }else{
-                    error!("accept error");
+                match res{
+                    Ok((client,_)) => {
+                        match TcpStream::connect((args.server.as_ref(), args.server_port)).await{
+                            Ok(remote) => {
+                                tokio::spawn(process(client,remote));
+                            },
+                            Err(err) => error!("remote unreachable: {err}")
+                        }
+                    },
+                    Err(err) => {
+                        error!(?err);
+                        break;
+                    },
                 }
             },
             _ = signal::ctrl_c() => {
@@ -61,28 +63,36 @@ async fn main() -> Result<()> {
             }
         }
     }
-
     Ok(())
 }
 
-async fn process(mut client: TcpStream, mut remote: EncryptWrapper) -> Result<()> {
-    let mut buff = BytesMut::new();
+#[instrument(level = Level::TRACE, skip(client, remote), ret)]
+async fn process(mut client: TcpStream, remote: TcpStream) -> Result<()> {
+    client.set_nodelay(true)?;
+    remote.set_nodelay(true)?;
 
-    // methods
+    let mut remote = Framed::new(remote, CryptoCodec::new());
+    let mut buff = BytesMut::with_capacity(8096);
+
+    // method selection
     client.read_buf(&mut buff).await?;
     client.write_all(&NO_AUTHENTICATION).await?;
     buff.clear();
 
-    // request
+    // reuse request package
     client.read_buf(&mut buff).await?;
     buff[1] = 0;
     client.write_all(&buff).await?;
 
+    // reuse address
     buff.advance(3);
-    let (addr, port, _) = parse_address(&buff);
+    let (addr, _, _) = parse_address(&buff)?;
+    debug!("connect: {addr}");
 
-    // fill initial payload
+    // get frist request
     client.read_buf(&mut buff).await?;
-    remote.write_all(&buff).await?;
-    relay(&mut client, &mut remote, &format!("{addr}:{port}")).await
+    remote.send(&buff).await?;
+    buff.clear();
+
+    relay(client, remote, buff, addr).await
 }
