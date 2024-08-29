@@ -1,25 +1,19 @@
-use anyhow::anyhow;
-use clap::{arg, Parser};
-use futures::{SinkExt, StreamExt};
-use ssrust::{parse_address, relay, Method};
-use ssrust::{Addr, Config, CryptoCodec};
-use std::io::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::select;
-use tokio::{net::TcpListener, signal};
-use tokio_util::codec::Framed;
-use tracing::{debug, error, info};
-use tracing_subscriber::fmt::format::FmtSpan;
+use anyhow::{Context, Result};
+use clap::Parser;
+use futures::StreamExt;
+use ssrust::{Address, Cipher, CryptoCodec, Method, DIAL_TIMEOUT};
+use std::net::SocketAddr;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{self, TcpListener, TcpStream};
+use tokio::time;
+use tokio_util::codec::Decoder;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version,about, long_about = None)]
+#[command(version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0:8388")]
     address: String,
-    #[arg(long)]
-    port: u16,
     #[arg(long)]
     password: String,
     #[arg(long, value_enum)]
@@ -30,60 +24,41 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .compact()
+        .with_target(false)
         .init();
 
     let args = Args::parse();
-    Config::init(args.method, &args.password);
-    let listener = TcpListener::bind((args.address, args.port)).await?;
+    Cipher::init(args.method, &args.password);
 
-    loop {
-        tokio::select! {
-            result  = listener.accept() => {
-                match result{
-                    Ok((socket,_)) => {
-                        tokio::spawn(process(socket));
-                    },
-                    Err(err) => {
-                        error!("accept error: {err}");
-                        break;
-                    },
-                }
-            }
-            _ = signal::ctrl_c() => {
-                info!("shutdown");
-                break;
-            }
-        }
-    }
-    Ok(())
+    let listener = TcpListener::bind(args.address).await?;
+    ssrust::listen!(listener)
 }
 
-async fn process(client: TcpStream) -> anyhow::Result<()> {
+async fn process(client: TcpStream) -> Result<()> {
     client.set_nodelay(true)?;
-    let mut client = Framed::new(client, CryptoCodec::new());
-    let mut buff = client
-        .next()
-        .await
-        .transpose()
-        .and_then(|op| op.ok_or(anyhow!("hehe")))?;
+    let mut client = CryptoCodec::new().framed(client);
 
-    // get remote address
-    // client.read_buf(&mut buff).await?;
-    let (addr, port, rest) = parse_address(&buff)?;
-    debug!("connect: {addr}");
+    let msg = match client.next().await.transpose()? {
+        Some(bytes) => bytes,
+        None => return Ok(()),
+    };
 
-    let mut remote = match &addr {
-        Addr::Ipv4(ip) => TcpStream::connect((*ip, port)).await,
-        Addr::Ipv6(ip) => TcpStream::connect((*ip, port)).await,
-        Addr::Domain(host) => TcpStream::connect((host.as_ref(), port)).await,
-    }?;
-    let _ = remote.set_nodelay(true);
-    // maybe with payload
-    if !rest.is_empty() {
-        remote.write_all(rest).await?;
-    }
-    buff.clear();
+    let (addr, port, rest) = ssrust::parse_address(&msg)?;
+    tracing::debug!("connect: {addr}");
 
-    relay(remote, client, buff, addr).await
+    let addrs = match &addr {
+        Address::Ip(ip) => vec![SocketAddr::new(*ip, port)],
+        Address::Domain(host) => net::lookup_host(format!("{host}:{port}")).await?.collect(),
+    };
+
+    let mut remote =
+        ssrust::flatten(time::timeout(DIAL_TIMEOUT, TcpStream::connect(addrs.as_slice())).await)
+            .with_context(|| format!("connect: {addr}"))?;
+    remote.set_nodelay(true)?;
+
+    remote.write_all(rest).await?;
+    drop(msg);
+
+    ssrust::relay!(remote, client, addr)
 }

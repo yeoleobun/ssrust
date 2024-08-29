@@ -7,33 +7,29 @@ shadowsocks of rust impletation
 - [ ] UDP
 
 ## Supported ciphers:
-- [x] aes_128_gcm
-- [x] aes_256_gcm
-- [x] chacha20_poly1305
+- [x] aes-128-gcm
+- [x] aes-256-gcm
+- [x] chacha20-poly1305
 
 Build
 -----
 
     $ cargo build --release
-    
+
 Usage
------    
+-----
 
     $ cd target/release/
 
-    $ ./server --port <PORT> --password <PASSWORD> --method <METHOD>
+    $ ./server --address <ADDRESS> --password <PASSWORD> --method <METHOD>
 
-    $ ./client --server <SERVER> --server-port <SERVER_PORT> --local-port <LOCAL_PORT> --password <PASSWORD> --method <METHOD>
+    $ ./client --remote-addr <REMOTE_ADDR> --local-addr <LOCAL_ADDR> --password <PASSWORD> --method <METHOD>
 
 --help for more detail
 
 Example
 -------
 
-    $ ./server --port 8388 --password "barfoo!" --method chacha20-poly1305
+    $ ./server --address 0.0.0.0:8388 --password barfoo! --method chacha20-poly1305
 
-    $ ./client --server 127.0.0.1 --server-port 8388  --local-port 1080 --password "barfoo!" --method chacha20-poly1305
-
-
-
-
+    $ ./client --remote-addr localhost:8388 --local-addr localhost:1080 --password barfoo! --method chacha20-poly1305
