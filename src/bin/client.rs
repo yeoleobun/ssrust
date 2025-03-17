@@ -1,14 +1,12 @@
-use anyhow::{Context, Result};
-use bytes::Buf;
-use bytes::BytesMut;
+use anyhow::Result;
+use bytes::{Buf, BytesMut};
 use clap::Parser;
-use futures::sink::SinkExt;
-use ssrust::{Cipher, CryptoCodec, Method, NotEnoughBytesError, BUFFER_SIZE, DIAL_TIMEOUT};
+use ssrust::{Address, BUFFER_SIZE, Cipher, CryptoCodec, DIAL_TIMEOUT, Method};
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{self, TcpListener, TcpStream};
-use tokio::time;
+use tokio::{signal, time};
 use tokio_util::codec::Decoder;
 use tracing_subscriber::EnvFilter;
 
@@ -29,8 +27,6 @@ struct Args {
     method: Method,
 }
 
-static REMOTE_ADDRS: OnceLock<Vec<SocketAddr>> = OnceLock::new();
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -40,14 +36,37 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    Cipher::init(args.method, &args.password);
-    let addrs = net::lookup_host(args.remote_addr).await?.collect();
-    REMOTE_ADDRS.set(addrs).expect("set remote address failed");
+
+    let cipher = Arc::new(Cipher::init(&args.method, &args.password));
+    let addrs: Arc<Vec<SocketAddr>> = Arc::new(net::lookup_host(args.remote_addr).await?.collect());
     let listener = TcpListener::bind(args.local_addr).await?;
-    ssrust::listen!(listener)
+    tracing::info!("listening on: {}", listener.local_addr().unwrap());
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                if let Ok((client, _)) = res {
+                    let addrs = addrs.clone();
+                    let cipher = cipher.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = process(client, addrs, cipher).await {
+                            tracing::error!("{:#}", e);
+                        }
+                    });
+                }
+            }
+            _ = signal::ctrl_c() => {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
-async fn process(mut client: TcpStream) -> Result<()> {
+async fn process(
+    mut client: TcpStream,
+    server: Arc<Vec<SocketAddr>>,
+    cipher: Arc<Cipher>,
+) -> Result<()> {
     client.set_nodelay(true)?;
     let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
 
@@ -58,25 +77,22 @@ async fn process(mut client: TcpStream) -> Result<()> {
 
     // reuse request packet
     client.read_buf(&mut buff).await?;
-    anyhow::ensure!(buff.len() >= 2, NotEnoughBytesError::new(2, buff.len()));
     buff[1] = 0;
     client.write_all(&buff).await?;
 
     // reuse request address
     buff.advance(3);
-    client.read_buf(&mut buff).await?;
 
-    let (addr, _, _) = ssrust::parse_address(&buff)?;
-    tracing::debug!("connect: {addr}");
+    let (addr, _) = Address::parse(&buff)?;
+    tracing::debug!("connecting: {addr}");
 
-    let addrs = REMOTE_ADDRS.get().expect("uninitialized").as_slice();
-    let res = time::timeout(DIAL_TIMEOUT, TcpStream::connect(addrs)).await;
-    let remote = ssrust::flatten(res).with_context(|| "remote unreachable")?;
+    let remote = time::timeout(DIAL_TIMEOUT, TcpStream::connect(&server[..]))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect server failed timeout"))?
+        .map_err(|e| anyhow::anyhow!("connect server failed: {e}"))?;
+
     remote.set_nodelay(true)?;
+    let mut remote = CryptoCodec::new(&cipher).framed(remote);
 
-    let mut remote = CryptoCodec::new().framed(remote);
-    remote.send(&buff).await?;
-    buff.clear();
-
-    ssrust::relay!(client, remote, addr, buff)
+    ssrust::relay_with_buf(&mut client, &mut remote, &mut buff, &addr).await
 }

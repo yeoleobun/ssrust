@@ -1,4 +1,4 @@
-use std::{result, time::Duration};
+use std::time::Duration;
 use thiserror::Error;
 pub const BUFFER_SIZE: usize = 4096;
 pub const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,20 +17,10 @@ impl NotEnoughBytesError {
     }
 }
 
-pub fn flatten<T, E1, E2>(nested: result::Result<result::Result<T, E2>, E1>) -> anyhow::Result<T>
-where
-    E1: std::error::Error + Send + Sync + 'static,
-    E2: std::error::Error + Send + Sync + 'static,
-{
-    let inner = nested?;
-    let val = inner?;
-    Ok(val)
-}
-
 mod cipher;
 mod codec;
 mod conn;
 
 pub use cipher::{Cipher, Method};
 pub use codec::CryptoCodec;
-pub use conn::{parse_address, Address};
+pub use conn::{Address, relay, relay_with_buf};

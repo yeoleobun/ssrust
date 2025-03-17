@@ -1,96 +1,127 @@
-use crate::NotEnoughBytesError;
-use bytes::Buf;
+use crate::{BUFFER_SIZE, CryptoCodec, NotEnoughBytesError, RELAY_TIMEOUT};
+use bytes::{Buf, BytesMut};
+use futures::StreamExt;
+use futures::sink::SinkExt;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use tokio::net::TcpStream;
+use tokio_util::codec::Framed;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+const ATYP_IPV4: u8 = 1;
+const ATYP_DOMAIN: u8 = 3;
+const ATYP_IPV6: u8 = 4;
+
+#[derive(Debug)]
 pub enum Address {
-    Ip(IpAddr),
-    Domain(String),
+    Ip(SocketAddr),
+    Domain(String, u16),
 }
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Address::Ip(ip) => write!(f, "{}", ip),
-            Address::Domain(host) => write!(f, "{}", host),
+            Address::Ip(addr) => write!(f, "{addr}"),
+            Address::Domain(host, port) => write!(f, "{host}:{port}"),
         }
     }
 }
 
-pub fn parse_address(mut buf: &[u8]) -> anyhow::Result<(Address, u16, &[u8])> {
-    anyhow::ensure!(buf.len() >= 7, NotEnoughBytesError::new(7, buf.len()));
-    let addr = match buf.get_u8() {
-        1 => Address::Ip(IpAddr::V4(buf.get_u32().into())),
-        4 => {
-            anyhow::ensure!(buf.len() >= 18, NotEnoughBytesError::new(18, buf.len()));
-            Address::Ip(IpAddr::V6(buf.get_u128().into()))
+impl Address {
+    pub fn to_socket_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
+        match self {
+            Address::Ip(socket_addr) => Ok(vec![*socket_addr]),
+            Address::Domain(host, port) => {
+                let iter = (host.as_str(), *port).to_socket_addrs()?;
+                Ok(iter.collect())
+            }
         }
-        3 => {
-            let n = buf.get_u8() as usize;
-            anyhow::ensure!(
-                buf.len() >= n + 2,
-                NotEnoughBytesError::new(n + 2, buf.len())
-            );
-            Address::Domain(String::from_utf8(buf.copy_to_bytes(n).to_vec())?)
+    }
+
+    pub fn parse(mut buf: &[u8]) -> anyhow::Result<(Address, &[u8])> {
+        if buf.len() < 1 {
+            return Err(NotEnoughBytesError::new(1, buf.len()).into());
         }
-        _ => anyhow::bail!("illegal address"),
-    };
-    Ok((addr, buf.get_u16(), buf))
+
+        let atyp = buf.get_u8();
+
+        let addr = match atyp {
+            ATYP_IPV4 => {
+                if buf.len() < 6 {
+                    return Err(NotEnoughBytesError::new(6, buf.len()).into());
+                }
+                let ip = IpAddr::V4(buf.get_u32().into());
+                let port = buf.get_u16();
+                Address::Ip(SocketAddr::new(ip, port))
+            }
+            ATYP_IPV6 => {
+                if buf.len() < 18 {
+                    return Err(NotEnoughBytesError::new(18, buf.len()).into());
+                }
+                let ip = IpAddr::V6(buf.get_u128().into());
+                let port = buf.get_u16();
+                Address::Ip(SocketAddr::new(ip, port))
+            }
+            ATYP_DOMAIN => {
+                if buf.len() < 1 {
+                    return Err(NotEnoughBytesError::new(1, buf.len()).into());
+                }
+
+                let n = buf.get_u8() as usize;
+
+                if buf.len() < n + 2 {
+                    return Err(NotEnoughBytesError::new(n + 2, buf.len()).into());
+                }
+
+                let domain = std::str::from_utf8(&buf[..n])?.to_string();
+                buf.advance(n);
+                let port = buf.get_u16();
+                Address::Domain(domain, port)
+            }
+            _ => anyhow::bail!("illegal address type: {atyp}"),
+        };
+
+        Ok((addr, buf))
+    }
 }
 
-#[macro_export]
-macro_rules! listen {
-    ($listener: expr) => {{
-        tracing::info!("listening on: {}", $listener.local_addr().unwrap());
-        loop {
-            tokio::select! {
-                res = tokio::net::TcpListener::accept(&$listener) => {
-                    match res{
-                        Ok((stream,_)) => {
-                            tokio::spawn(futures::future::FutureExt::map(process(stream), |res| {
-                                res.inspect_err(|err| tracing::warn!("{:#}",err))
-                            }));
-                        },
-                        Err(cause) => tracing::warn!("accept err: {cause}")
-                    }
-                },
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutdown");
+pub async fn relay(
+    plain: &mut TcpStream,
+    framed: &mut Framed<TcpStream, CryptoCodec<'_>>,
+    addr: &Address,
+) -> anyhow::Result<()>
+where
+{
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
+    relay_with_buf(plain, framed, &mut buf, addr).await
+}
+
+pub async fn relay_with_buf(
+    plain: &mut TcpStream,
+    framed: &mut Framed<TcpStream, CryptoCodec<'_>>,
+    buff: &mut BytesMut,
+    addr: &Address,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            count = plain.read_buf(buff) => {
+                if count? == 0 {
                     break;
                 }
+                framed.send(buff).await?;
+                buff.clear();
             }
-        }
-        Ok(())
-    }};
-}
-
-#[macro_export]
-macro_rules! relay {
-    ($plain: expr, $framed: expr, $addr: expr) => {{
-        let mut buff = bytes::BytesMut::with_capacity($crate::BUFFER_SIZE);
-        $crate::relay!($plain, $framed, $addr, buff)
-    }};
-    ($plain: expr, $framed: expr, $addr: expr, $buff: expr) => {{
-        loop {
-            tokio::select! {
-                count = tokio::io::AsyncReadExt::read_buf(&mut $plain, &mut $buff) => {
-                    if 0 == anyhow::Context::with_context(count,|| format!("relay: {}",$addr))?{
-                        break;
-                    }
-                    futures::sink::SinkExt::send(&mut $framed, &$buff).await?;
-                    bytes::BytesMut::clear(&mut $buff);
-                }
-                res = futures::stream::StreamExt::next(&mut $framed) => {
-                    match res.transpose()?{
-                        Some(msg) => tokio::io::AsyncWriteExt::write_all(&mut $plain, &msg).await?,
-                        None => break,
-                    }
-                }
-                _ = tokio::time::sleep($crate::RELAY_TIMEOUT) => {
-                    anyhow::bail!(format!("timeout: {}",$addr))
+            res = framed.next() => {
+                match res.transpose()?{
+                    Some(msg) => plain.write_all(&msg).await?,
+                    None => break,
                 }
             }
+            _ = tokio::time::sleep(RELAY_TIMEOUT) => {
+                tracing::warn!("relay {addr} timeout");
+                break;
+            }
         }
-        Ok(())
-    }};
+    }
+    Ok(())
 }

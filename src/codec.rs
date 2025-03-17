@@ -1,33 +1,42 @@
 use crate::cipher::{Cipher, Counter};
 use anyhow::{Error, Result};
-use bytes::BufMut;
-use bytes::BytesMut;
-use ring::aead::{Aad, BoundKey, OpeningKey, SealingKey, MAX_TAG_LEN};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rand::RngCore;
+use ring::aead::{Aad, BoundKey, MAX_TAG_LEN, OpeningKey, SealingKey};
 use tokio_util::codec::{Decoder, Encoder};
 
-#[derive(Default)]
-pub struct CryptoCodec {
+pub struct CryptoCodec<'a> {
+    cipher: &'a Cipher,
     opening_key: Option<OpeningKey<Counter>>,
     sealing_key: Option<SealingKey<Counter>>,
     payload_length: Option<usize>,
 }
 
-impl CryptoCodec {
-    pub fn new() -> CryptoCodec {
-        CryptoCodec::default()
+impl<'a> CryptoCodec<'a> {
+    pub fn new(cipher: &'a Cipher) -> CryptoCodec<'a> {
+        CryptoCodec {
+            cipher,
+            opening_key: None,
+            sealing_key: None,
+            payload_length: None,
+        }
     }
 }
-impl Encoder<&[u8]> for CryptoCodec {
+
+impl Encoder<&[u8]> for CryptoCodec<'_> {
     type Error = Error;
 
     fn encode(&mut self, item: &[u8], dst: &mut BytesMut) -> Result<()> {
         let sealing_key = match self.sealing_key.as_mut() {
             Some(k) => k,
             None => {
-                let (sub_key, salt) = Cipher::session_key()?;
+                let mut salt = vec![0u8; self.cipher.key_len()];
+                rand::rng().fill_bytes(&mut salt);
+                let session_key = self.cipher.new_session_key(&salt)?;
+
                 dst.put_slice(salt.as_slice());
                 self.sealing_key
-                    .insert(SealingKey::new(sub_key, Counter::zero()))
+                    .insert(SealingKey::new(session_key, Counter::zero()))
             }
         };
 
@@ -49,19 +58,19 @@ impl Encoder<&[u8]> for CryptoCodec {
     }
 }
 
-impl Decoder for CryptoCodec {
-    type Item = BytesMut;
+impl Decoder for CryptoCodec<'_> {
+    type Item = Bytes;
     type Error = Error;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>> {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Bytes>> {
         let opening_key = match self.opening_key.as_mut() {
             Some(key) => key,
             None => {
-                let salt_size = Cipher::salt_len();
+                let salt_size = self.cipher.key_len();
                 if src.len() < salt_size {
                     return Ok(None);
                 }
-                let sub_key = Cipher::session_key_with_salt(&src.split_to(salt_size))?;
+                let sub_key = self.cipher.new_session_key(&src.split_to(salt_size))?;
                 self.opening_key
                     .insert(OpeningKey::new(sub_key, Counter::zero()))
             }
@@ -72,12 +81,10 @@ impl Decoder for CryptoCodec {
             Some(n) => n,
             None => {
                 if src.len() < 2 + MAX_TAG_LEN {
-                    src.reserve(2 + MAX_TAG_LEN - src.len());
                     return Ok(None);
                 }
                 let mut header = src.split_to(2 + MAX_TAG_LEN);
                 opening_key.open_in_place(Aad::empty(), &mut header)?;
-                use bytes::Buf;
                 *self.payload_length.insert(header.get_u16() as usize)
             }
         };
@@ -92,6 +99,7 @@ impl Decoder for CryptoCodec {
         let mut payload = src.split_to(length + MAX_TAG_LEN);
         opening_key.open_in_place(Aad::empty(), &mut payload)?;
         payload.truncate(length);
-        Ok(Some(payload))
+
+        Ok(Some(payload.freeze()))
     }
 }

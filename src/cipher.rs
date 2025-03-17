@@ -1,13 +1,12 @@
 use anyhow::Result;
-use ring::aead::{Algorithm, Nonce, NonceSequence, UnboundKey};
-use ring::aead::{AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305, NONCE_LEN};
+use ring::aead::{
+    AES_128_GCM, AES_256_GCM, Algorithm, CHACHA20_POLY1305, NONCE_LEN, Nonce, NonceSequence,
+    UnboundKey,
+};
 use ring::error::Unspecified;
-use ring::hkdf::{Salt, HKDF_SHA1_FOR_LEGACY_USE_ONLY, HKDF_SHA256};
-use ring::rand::{SecureRandom, SystemRandom};
-use std::sync::OnceLock;
+use ring::hkdf::{HKDF_SHA1_FOR_LEGACY_USE_ONLY, Salt};
 
 const INFO: [&[u8]; 1] = [b"ss-subkey"];
-static CIPHER: OnceLock<Cipher> = OnceLock::new();
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
@@ -17,8 +16,8 @@ pub enum Method {
     CHACHA20_POLY1305,
 }
 
-impl From<Method> for &'static Algorithm {
-    fn from(value: Method) -> Self {
+impl From<&Method> for &'static Algorithm {
+    fn from(value: &Method) -> Self {
         match value {
             Method::AES_128_GCM => &AES_128_GCM,
             Method::AES_256_GCM => &AES_256_GCM,
@@ -38,11 +37,13 @@ impl Counter {
 impl NonceSequence for Counter {
     fn advance(&mut self) -> Result<Nonce, Unspecified> {
         let nonce = Nonce::assume_unique_for_key(self.0);
-        let mut y = 1u32;
-        for x in &mut self.0 {
-            y += *x as u32;
-            *x = y as u8;
-            y >>= 8;
+        let mut carry = 1u32;
+        let mut i = 0;
+        while i < NONCE_LEN && carry > 0 {
+            carry += self.0[i] as u32;
+            self.0[i] = carry as u8;
+            carry >>= 8;
+            i += 1;
         }
         Ok(nonce)
     }
@@ -50,59 +51,43 @@ impl NonceSequence for Counter {
 
 #[derive(Debug)]
 pub struct Cipher {
-    alogrithm: &'static Algorithm,
+    algorithm: &'static Algorithm,
     master_key: Vec<u8>,
-    rng: SystemRandom,
 }
 
 impl Cipher {
-    pub fn init(method: Method, password: &str) {
-        let alogrithm: &'static Algorithm = method.into();
-        let config = Cipher {
-            alogrithm,
-            master_key: bytes_to_key(password, alogrithm.key_len()),
-            rng: SystemRandom::new(),
-        };
-        CIPHER.set(config).expect("set cipher failed");
+    pub fn init(method: &Method, password: &str) -> Cipher {
+        let algorithm: &'static Algorithm = method.into();
+        let master_key = Self::bytes_to_key(password, algorithm.key_len());
+        Cipher {
+            algorithm,
+            master_key,
+        }
     }
 
-    pub(crate) fn salt_len() -> usize {
-        Cipher::get().alogrithm.key_len()
-    }
-
-    pub(crate) fn session_key() -> Result<(UnboundKey, Vec<u8>)> {
-        let cipher = Cipher::get();
-        let mut salt = vec![0u8; cipher.alogrithm.key_len()];
-        cipher.rng.fill(&mut salt)?;
-        let subkey = Cipher::session_key_with_salt(&salt)?;
-        Ok((subkey, salt))
+    pub(crate) fn key_len(&self) -> usize {
+        self.algorithm.key_len()
     }
 
     // hkdf-sha1, derivi session key from master key
-    pub(crate) fn session_key_with_salt(salt: &[u8]) -> Result<UnboundKey> {
-        let cipher = Cipher::get();
-        let mut key_bytes = vec![0u8; 32];
+    pub(crate) fn new_session_key(&self, salt: &[u8]) -> Result<UnboundKey> {
+        let mut key_bytes = vec![0u8; self.key_len()];
         Salt::new(HKDF_SHA1_FOR_LEGACY_USE_ONLY, salt)
-            .extract(&cipher.master_key)
-            .expand(&INFO, HKDF_SHA256)?
+            .extract(&self.master_key)
+            .expand(&INFO, self.algorithm)?
             .fill(&mut key_bytes)?;
-        key_bytes.truncate(cipher.alogrithm.key_len());
-        Ok(UnboundKey::new(cipher.alogrithm, &key_bytes)?)
+        Ok(UnboundKey::new(self.algorithm, &key_bytes)?)
     }
 
-    fn get() -> &'static Cipher {
-        CIPHER.get().expect("uninitialized")
+    // EVP_BytesToKey, derive master key from password
+    fn bytes_to_key(password: &str, len: usize) -> Vec<u8> {
+        let mut res = Vec::with_capacity(len);
+        for _ in 0..(len / 16) {
+            let mut ctx = md5::Context::new();
+            ctx.consume(&res);
+            ctx.consume(password);
+            res.extend(*ctx.compute());
+        }
+        res
     }
-}
-
-// EVP_BytesToKey, derive master key from password
-fn bytes_to_key(password: &str, len: usize) -> Vec<u8> {
-    let mut res = Vec::with_capacity(len);
-    for _ in 0..(len / 16) {
-        let mut ctx = md5::Context::new();
-        ctx.consume(&res);
-        ctx.consume(password);
-        res.extend(*ctx.compute());
-    }
-    res
 }
